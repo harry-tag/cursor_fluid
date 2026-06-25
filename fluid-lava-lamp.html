@@ -1,0 +1,259 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fluid — cursor-reactive lava lamp</title>
+<style>
+  :root{
+    --ink:#e8eae3;
+    --ink-dim:#8a948a;
+    --hair:rgba(232,234,227,.16);
+    --bg:#0a0c0b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ink)}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+
+  /* Lab-instrument overlay: quiet, monospaced, sits in the corner like a readout */
+  .hud{position:fixed;left:18px;bottom:18px;z-index:2;
+    font-size:11px;letter-spacing:.08em;line-height:1.9;
+    -webkit-user-select:none;user-select:none;mix-blend-mode:difference}
+  .hud .row{display:flex;gap:10px}
+  .hud .k{color:var(--ink-dim);text-transform:uppercase}
+  .hud .v{color:var(--ink);font-variant-numeric:tabular-nums}
+
+  .panel{position:fixed;right:18px;bottom:18px;z-index:2;
+    display:grid;gap:11px;min-width:184px;
+    padding:14px 15px;border:1px solid var(--hair);border-radius:2px;
+    background:rgba(10,12,11,.42);backdrop-filter:blur(8px)}
+  .panel .title{font-size:10px;letter-spacing:.22em;color:var(--ink-dim);
+    text-transform:uppercase;margin-bottom:2px}
+  .ctrl{display:grid;gap:5px}
+  .ctrl label{display:flex;justify-content:space-between;font-size:10px;
+    letter-spacing:.1em;color:var(--ink-dim);text-transform:uppercase}
+  .ctrl label b{color:var(--ink);font-weight:400;font-variant-numeric:tabular-nums}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:2px;
+    background:var(--hair);outline:none;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:11px;height:11px;
+    border-radius:50%;background:var(--ink);cursor:pointer}
+  input[type=range]::-moz-range-thumb{width:11px;height:11px;border:0;border-radius:50%;
+    background:var(--ink);cursor:pointer}
+  .palettes{display:flex;gap:6px}
+  .sw{flex:1;height:18px;border:1px solid var(--hair);border-radius:2px;cursor:pointer;
+    padding:0;opacity:.55;transition:opacity .15s,transform .15s}
+  .sw[aria-pressed=true]{opacity:1;transform:scaleY(1.18)}
+  .hint{position:fixed;top:18px;left:18px;z-index:2;font-size:10px;letter-spacing:.14em;
+    color:var(--ink-dim);text-transform:uppercase;mix-blend-mode:difference}
+  @media (max-width:560px){.panel{left:18px;right:18px;bottom:74px}}
+</style>
+
+<canvas id="gl"></canvas>
+<div class="hint">Move the cursor — the fluid follows with momentum</div>
+<div class="hud">
+  <div class="row"><span class="k">flow</span><span class="v" id="rFlow">0.00</span></div>
+  <div class="row"><span class="k">visc</span><span class="v" id="rVisc">0.00</span><span class="k">cst</span></div>
+  <div class="row"><span class="k">pos</span><span class="v" id="rPos">0.50, 0.50</span></div>
+</div>
+
+<div class="panel">
+  <div class="title">Fluid · controls</div>
+  <div class="ctrl"><label>Speed <b id="vSpeed">0.35</b></label>
+    <input id="sSpeed" type="range" min="0" max="1" step="0.01" value="0.35"></div>
+  <div class="ctrl"><label>Turbulence <b id="vWarp">3.2</b></label>
+    <input id="sWarp" type="range" min="0" max="6" step="0.05" value="3.2"></div>
+  <div class="ctrl"><label>Cursor force <b id="vForce">0.55</b></label>
+    <input id="sForce" type="range" min="0" max="1.2" step="0.01" value="0.55"></div>
+  <div class="ctrl"><label>Palette</label>
+    <div class="palettes" id="pals"></div></div>
+</div>
+
+<script>
+const cv = document.getElementById('gl');
+const gl = cv.getContext('webgl', {antialias:false, premultipliedAlpha:false});
+if(!gl){ document.body.innerHTML = '<p style="color:#e8eae3;font:14px monospace;padding:24px">WebGL not available in this browser.</p>'; }
+
+const VERT = `attribute vec2 p; void main(){ gl_Position = vec4(p,0.,1.); }`;
+
+const FRAG = `
+precision highp float;
+uniform vec2  u_res;
+uniform float u_time;
+uniform vec2  u_mouse;   // eased, normalized 0..1
+uniform float u_speed;
+uniform float u_warp;
+uniform float u_force;
+uniform int   u_pal;
+
+// --- Ashima simplex noise (2D) ---
+vec3 permute(vec3 x){ return mod(((x*34.0)+1.0)*x, 289.0); }
+float snoise(vec2 v){
+  const vec4 C = vec4(0.211324865405187,0.366025403784439,
+                     -0.577350269189626,0.024390243902439);
+  vec2 i  = floor(v + dot(v, C.yy));
+  vec2 x0 = v - i + dot(i, C.xx);
+  vec2 i1 = (x0.x > x0.y) ? vec2(1.0,0.0) : vec2(0.0,1.0);
+  vec4 x12 = x0.xyxy + C.xxzz; x12.xy -= i1;
+  i = mod(i, 289.0);
+  vec3 perm = permute( permute( i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+  vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+  m = m*m; m = m*m;
+  vec3 x = 2.0 * fract(perm * C.www) - 1.0;
+  vec3 h = abs(x) - 0.5;
+  vec3 ox = floor(x + 0.5);
+  vec3 a0 = x - ox;
+  m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+  vec3 g;
+  g.x  = a0.x  * x0.x  + h.x  * x0.y;
+  g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+  return 130.0 * dot(m, g);
+}
+
+float fbm(vec2 p){
+  float f = 0.0, amp = 0.5;
+  for(int i=0;i<5;i++){ f += amp*snoise(p); p *= 2.02; amp *= 0.5; }
+  return f;
+}
+
+// Inigo Quilez cosine palette
+vec3 cosp(float t, vec3 a, vec3 b, vec3 c, vec3 d){
+  return a + b*cos(6.28318*(c*t + d));
+}
+vec3 palette(float t, int id){
+  if(id==0) return cosp(t, vec3(.50,.50,.52), vec3(.50,.48,.50),
+                          vec3(1.,1.,1.), vec3(.00,.10,.20));            // ink / cool
+  if(id==1) return cosp(t, vec3(.62,.58,.50), vec3(.30,.28,.22),
+                          vec3(1.,1.,1.), vec3(.10,.15,.20));            // omen sage/cream
+  if(id==2) return cosp(t, vec3(.55,.40,.30), vec3(.45,.30,.20),
+                          vec3(1.,.9,.7),  vec3(.05,.35,.55));           // lava warm
+  return cosp(t, vec3(.30,.40,.55), vec3(.30,.30,.40),
+                vec3(1.,1.,1.), vec3(.55,.30,.20));                     // deep teal/violet
+}
+
+void main(){
+  float aspect = u_res.x / u_res.y;
+  vec2 uv = gl_FragCoord.xy / u_res;
+  vec2 p  = uv; p.x *= aspect;
+
+  vec2 m  = u_mouse; m.x *= aspect;
+  float d = distance(p, m);
+  float bulge = exp(-d*d*9.0);                     // gaussian well around cursor
+
+  float t = u_time * (0.05 + u_speed*0.35);
+
+  // two-level domain warp -> organic, folding lava-lamp motion
+  vec2 q = vec2(fbm(p*1.4 + vec2(0.0,  t*0.6)),
+                fbm(p*1.4 + vec2(5.2, -t*0.5) + 1.3));
+  vec2 r = vec2(fbm(p*1.4 + u_warp*q + vec2(1.7,9.2) + t*0.7),
+                fbm(p*1.4 + u_warp*q + vec2(8.3,2.8) - t*0.6));
+
+  // cursor pushes the field outward like a finger in liquid
+  r += u_force * bulge * normalize(p - m + 0.0001) * 0.9;
+
+  float f = fbm(p*1.4 + u_warp*r);
+  f = f*0.5 + 0.5;
+  f += bulge * u_force * 0.35;                      // brighten the well slightly
+
+  vec3 col = palette(clamp(f,0.0,1.0), u_pal);
+  col *= 0.82 + 0.30*f;                             // gentle depth
+  col = pow(col, vec3(0.92));                       // lift midtones
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog); gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const U = {
+  res:   gl.getUniformLocation(prog,'u_res'),
+  time:  gl.getUniformLocation(prog,'u_time'),
+  mouse: gl.getUniformLocation(prog,'u_mouse'),
+  speed: gl.getUniformLocation(prog,'u_speed'),
+  warp:  gl.getUniformLocation(prog,'u_warp'),
+  force: gl.getUniformLocation(prog,'u_force'),
+  pal:   gl.getUniformLocation(prog,'u_pal'),
+};
+
+// --- state ---
+const state = { speed:0.35, warp:3.2, force:0.55, pal:1 };
+let target = {x:0.5, y:0.5}, eased = {x:0.5, y:0.5}, vel = 0;
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const RENDER_SCALE = 0.75;          // soft effect -> render below native for smoothness
+
+function resize(){
+  const dpr = Math.min(devicePixelRatio||1, 1.5) * RENDER_SCALE;
+  const w = Math.max(1, Math.floor(innerWidth*dpr));
+  const h = Math.max(1, Math.floor(innerHeight*dpr));
+  if(cv.width!==w || cv.height!==h){ cv.width=w; cv.height=h; gl.viewport(0,0,w,h); }
+}
+addEventListener('resize', resize); resize();
+
+function setPointer(clientX, clientY){
+  target.x = clientX/innerWidth;
+  target.y = 1 - clientY/innerHeight;     // flip to GL coords
+}
+addEventListener('pointermove', e => setPointer(e.clientX, e.clientY));
+addEventListener('pointerdown', e => setPointer(e.clientX, e.clientY));
+
+// --- controls wiring ---
+const wire = (id, key, dp) => {
+  const s = document.getElementById('s'+id), v = document.getElementById('v'+id);
+  s.addEventListener('input', () => { state[key] = parseFloat(s.value); v.textContent = (+s.value).toFixed(dp); });
+};
+wire('Speed','speed',2); wire('Warp','warp',1); wire('Force','force',2);
+
+const palNames = ['ink','sage','lava','teal'];
+const pals = document.getElementById('pals');
+palNames.forEach((name,i)=>{
+  const b = document.createElement('button');
+  b.className='sw'; b.title=name; b.setAttribute('aria-pressed', String(i===state.pal));
+  // approximate swatch background per palette
+  b.style.background = ['linear-gradient(90deg,#6a6f78,#aeb4bd)',
+                        'linear-gradient(90deg,#5d5a45,#cfc7a8)',
+                        'linear-gradient(90deg,#7a3b1f,#e8a45a)',
+                        'linear-gradient(90deg,#27435c,#9a6fb0)'][i];
+  b.addEventListener('click', ()=>{ state.pal=i;
+    [...pals.children].forEach((c,j)=>c.setAttribute('aria-pressed', String(j===i))); });
+  pals.appendChild(b);
+});
+
+// --- readouts ---
+const rFlow=document.getElementById('rFlow'), rVisc=document.getElementById('rVisc'), rPos=document.getElementById('rPos');
+
+let t0 = performance.now();
+function frame(now){
+  const time = reduce ? 0 : (now - t0)/1000;
+  // ease the pointer so the fluid trails with momentum
+  const dx = target.x-eased.x, dy = target.y-eased.y;
+  eased.x += dx*0.05; eased.y += dy*0.05;
+  vel = vel*0.9 + Math.hypot(dx,dy)*0.1;          // smoothed flow speed
+
+  gl.uniform2f(U.res, cv.width, cv.height);
+  gl.uniform1f(U.time, time);
+  gl.uniform2f(U.mouse, eased.x, eased.y);
+  gl.uniform1f(U.speed, state.speed);
+  gl.uniform1f(U.warp, state.warp);
+  gl.uniform1f(U.force, state.force);
+  gl.uniform1i(U.pal, state.pal);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  rFlow.textContent = (vel*40).toFixed(2);
+  rVisc.textContent = (3.7 - vel*18).toFixed(2);   // playful nod: faster flow -> "thinner" fluid
+  rPos.textContent  = eased.x.toFixed(2)+', '+eased.y.toFixed(2);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
